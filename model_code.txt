@@ -1,0 +1,142 @@
+step 1)
+import pandas as pd
+
+df = pd.read_csv("synthetic_marathi_pairs_v3.txt", sep="\t", header=None).head(10000)
+df.columns = ["incorrect", "correct"]
+df = df.dropna().drop_duplicates()
+df["incorrect"] = df["incorrect"].str.strip()
+df["correct"] = df["correct"].str.strip()
+
+print(df.head())
+print("Samples:", len(df))
+
+step 2)
+from datasets import Dataset
+
+dataset = Dataset.from_pandas(df)
+
+# Train/Validation split
+split_dataset = dataset.train_test_split(test_size=0.1)
+train_dataset = split_dataset['train']
+val_dataset = split_dataset['test']
+
+print(train_dataset, val_dataset)
+
+step 3)
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("ai4bharat/IndicBART")
+
+def tokenize_function(example):
+    model_inputs = tokenizer(
+        example["incorrect"],
+        max_length=64,
+        padding="max_length",
+        truncation=True
+    )
+    labels = tokenizer(
+        example["correct"],
+        max_length=64,
+        padding="max_length",
+        truncation=True
+    )
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
+tokenized_train = train_dataset.map(tokenize_function, batched=True)
+tokenized_val = val_dataset.map(tokenize_function, batched=True)
+
+step 4)
+from transformers import AutoModelForSeq2SeqLM
+model = AutoModelForSeq2SeqLM.from_pretrained("ai4bharat/IndicBART")
+from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
+
+training_args = Seq2SeqTrainingArguments(
+    output_dir="./results",
+    eval_strategy="epoch",
+    learning_rate=3e-5,
+    per_device_train_batch_size=2,   
+    gradient_accumulation_steps=4,  
+    num_train_epochs=4,              
+    weight_decay=0.01,
+    save_total_limit=1,
+    predict_with_generate=True,
+    fp16=True,
+    dataloader_num_workers=4
+)
+
+model.gradient_checkpointing_enable()   # optional for memory saving
+
+
+trainer = Seq2SeqTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_train,
+    eval_dataset=tokenized_val,
+    tokenizer=tokenizer
+)
+
+trainer.train()
+
+model.save_pretrained("lang_analyzer_model")
+tokenizer.save_pretrained("lang_analyzer_model")
+
+step 5)
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+
+
+tokenizer = AutoTokenizer.from_pretrained("lang_analyzer_model")
+model = AutoModelForSeq2SeqLM.from_pretrained("lang_analyzer_model")
+
+test_sentences = ["मल शाळत जाायचं आहे", "तो घरी नाही गेलं"]
+
+
+inputs = tokenizer(test_sentences, return_tensors="pt", padding=True, truncation=True, max_length=64)
+inputs.pop("token_type_ids", None) 
+
+
+outputs = model.generate(**inputs, max_length=64, num_beams=5, early_stopping=True)
+
+
+for sent, out in zip(test_sentences, outputs):
+    pred = tokenizer.decode(out, skip_special_tokens=True)
+    print("Incorrect:", sent)
+    print("Corrected:", pred)
+    print()
+
+
+step 6)
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+
+tokenizer = AutoTokenizer.from_pretrained("lang_analyzer_model")
+model = AutoModelForSeq2SeqLM.from_pretrained("lang_analyzer_model")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# Tokenize inputs
+tokenized = tokenizer(
+    inputs,
+    return_tensors="pt",
+    padding=True,
+    truncation=True,
+    max_length=64
+)
+
+# ✅ Remove token_type_ids (IndicBART doesn’t use it)
+tokenized.pop("token_type_ids", None)
+
+# Move tensors to GPU/CPU
+tokenized = {k: v.to(device) for k, v in tokenized.items()}
+
+# Generate predictions
+outputs = model.generate(**tokenized, max_length=64, num_beams=5)
+preds = [tokenizer.decode(o, skip_special_tokens=True) for o in outputs]
+
+
+step 7)
+import evaluate
+bleu = evaluate.load("bleu")
+print("BLEU Score:", bleu.compute(predictions=preds,references=[[r] for r in refs])["bleu"])
